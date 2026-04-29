@@ -1,0 +1,4 @@
+telethon==1.36.0
+huggingface_hub==0.33.2
+datasets==3.0.2
+python-dotenv==1.0.1
