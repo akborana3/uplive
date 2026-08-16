@@ -17,6 +17,13 @@ from telethon.tl.custom.message import Message
 from app.config import Settings
 from app.storage.hf_dataset import HFDataStore
 from app.utils.media import send_payload, serialize_message
+from app.utils.stats_agg import (
+    agg_add,
+    agg_update,
+    dc_bucket_key,
+    empty_stats_agg,
+    lang_bucket_key,
+)
 from app.worker import Priority, WorkerPool
 
 logger = logging.getLogger(__name__)
@@ -67,10 +74,27 @@ class AssistantRuntime:
         self.client.add_event_handler(self._on_new_message, events.NewMessage(incoming=True))
         self.client.add_event_handler(self._on_callback, events.CallbackQuery)
 
-    def _ensure_user(self, user_id: int, premium: bool) -> dict[str, Any]:
+    def _ensure_user(
+        self,
+        user_id: int,
+        premium: bool,
+        dc_id: int | str | None = None,
+        lang_code: str | None = None,
+    ) -> dict[str, Any]:
+        """Create/update a user record and keep ``stats_agg`` in sync in O(1).
+
+        ``dc_id``/``lang_code`` are only resolved from Telegram some of the
+        time (dc_id needs a profile photo, lang_code needs Telegram to have
+        surfaced it for that peer) -- so a call that couldn't resolve one of
+        them never overwrites a previously-known value with "unknown".
+        """
         users = self.data.setdefault("users", {})
+        agg = self.data.setdefault("stats_agg", empty_stats_agg())
         user_key = str(user_id)
         now = datetime.now(timezone.utc).isoformat()
+        new_dc = dc_bucket_key(dc_id)
+        new_lang = lang_bucket_key(lang_code)
+
         if user_key not in users:
             users[user_key] = {
                 "premium": premium,
@@ -79,10 +103,29 @@ class AssistantRuntime:
                 "last_seen": now,
                 "start_count": 0,
                 "message_count": 0,
+                "dc_id": new_dc,
+                "lang_code": new_lang,
             }
-        users[user_key]["premium"] = premium
-        users[user_key]["last_seen"] = now
-        return users[user_key]
+            agg_add(agg, new_dc, new_lang, premium)
+            return users[user_key]
+
+        rec = users[user_key]
+        rec["last_seen"] = now
+
+        old_dc = rec.get("dc_id", "unknown")
+        old_lang = rec.get("lang_code", "unknown")
+        old_premium = bool(rec.get("premium"))
+
+        # Keep whatever we already knew if this call didn't resolve a value.
+        effective_dc = new_dc if new_dc != "unknown" else old_dc
+        effective_lang = new_lang if new_lang != "unknown" else old_lang
+
+        agg_update(agg, old_dc, old_lang, old_premium, effective_dc, effective_lang, premium)
+
+        rec["dc_id"] = effective_dc
+        rec["lang_code"] = effective_lang
+        rec["premium"] = premium
+        return rec
 
     async def _log_user_message(self, event: events.NewMessage.Event, user_id: int) -> None:
         """Forward a user message to the log chat.
@@ -247,7 +290,10 @@ class AssistantRuntime:
 
         sender = await event.get_sender()
         premium = bool(getattr(sender, "premium", False))
-        user_data = self._ensure_user(event.sender_id, premium)
+        lang_code = getattr(sender, "lang_code", None)
+        photo = getattr(sender, "photo", None)
+        dc_id = getattr(photo, "dc_id", None) if photo else None
+        user_data = self._ensure_user(event.sender_id, premium, dc_id=dc_id, lang_code=lang_code)
         user_data["message_count"] += 1
         self.data.setdefault("stats", {"total_starts": 0, "total_messages": 0})
         self.data["stats"]["total_messages"] += 1
@@ -268,26 +314,109 @@ class AssistantRuntime:
             self._log_user_message(event, event.sender_id), Priority.LOG
         )
 
+    def _stats_agg(self) -> dict[str, Any]:
+        return self.data.setdefault("stats_agg", empty_stats_agg())
+
     def _stats_text(self) -> str:
+        """Overview text. All numbers here are O(1) reads: ``len(users)`` and
+        the incrementally-maintained ``stats_agg`` counters — no scanning the
+        full user dict, so this stays fast at any scale."""
         users = self.data.get("users", {})
         total = len(users)
-        premium = sum(1 for u in users.values() if u.get("premium"))
-        blocked = len(self.data.get("blocked_users", []))
+        agg = self._stats_agg()
+        premium = agg.get("premium_count", 0)
         non_premium = total - premium
+        blocked = len(self.data.get("blocked_users", []))
         admins = sorted(self._admins())
         stats = self.data.get("stats", {})
+        avg_msgs = (stats.get("total_messages", 0) / total) if total else 0.0
         return (
-            f"Total users: {total}\n"
-            f"Premium users: {premium}\n"
-            f"Non-premium users: {non_premium}\n"
-            f"Blocked users: {blocked}\n"
+            f"Total users: {total:,}\n"
+            f"Premium users: {premium:,}\n"
+            f"Non-premium users: {non_premium:,}\n"
+            f"Blocked users: {blocked:,}\n"
             f"Total admins: {len(admins)}\n"
             f"Admin IDs: {', '.join(map(str, admins))}\n"
-            f"Total /start count: {stats.get('total_starts', 0)}\n"
-            f"Total messages count: {stats.get('total_messages', 0)}\n"
+            f"Total /start count: {stats.get('total_starts', 0):,}\n"
+            f"Total messages count: {stats.get('total_messages', 0):,}\n"
+            f"Avg messages/user: {avg_msgs:.2f}\n"
+            f"Distinct DCs seen: {len(agg.get('by_dc', {}))} | "
+            f"Distinct languages seen: {len(agg.get('by_lang', {}))}\n"
             f"Worker pool — queue: {self._pool.queue_depth()} "
             f"| active workers: {self._pool.active_workers()}"
         )
+
+    def _stats_buttons(self) -> list[list[Button]]:
+        return [
+            [
+                Button.inline("📍 DC", data=f"astatsdc:{self.assistant_id}"),
+                Button.inline("🌐 Language", data=f"astatslang:{self.assistant_id}"),
+            ]
+        ]
+
+    @staticmethod
+    def _sorted_dc_keys(by_dc: dict[str, Any]) -> list[str]:
+        def sort_key(k: str) -> tuple[int, int | str]:
+            if k.isdigit():
+                return (0, int(k))
+            return (1, k)  # "unknown" sorts last
+
+        return sorted(by_dc.keys(), key=sort_key)
+
+    def _stats_dc_text(self) -> str:
+        agg = self._stats_agg()
+        by_dc = agg.get("by_dc", {})
+        lines = ["📍  DC BREAKDOWN", "─────────────────────────"]
+        if not by_dc:
+            lines.append("No data yet.")
+        for key in self._sorted_dc_keys(by_dc):
+            bucket = by_dc[key]
+            total = bucket.get("total", 0)
+            premium = bucket.get("premium", 0)
+            normal = total - premium
+            label = f"DC{key}" if key.isdigit() else "Unknown"
+            lines.append(f"[{label}]")
+            lines.append(f"Total   : {total:,}")
+            lines.append(f"Premium : {premium:,}")
+            lines.append(f"Normal  : {normal:,}")
+        lines.append("")
+        lines.append(
+            "ⓘ DC is only known for users with a profile photo — others fall "
+            "under Unknown."
+        )
+        return "\n".join(lines)
+
+    def _stats_lang_text(self) -> str:
+        users = self.data.get("users", {})
+        total = len(users)
+        agg = self._stats_agg()
+        premium_total = agg.get("premium_count", 0)
+        normal_total = total - premium_total
+        by_lang = agg.get("by_lang", {})
+
+        lines = [
+            "👥  USER STATISTICS",
+            "─────────────────────────",
+            f"Total users    : {total:,}",
+            f"⭐ Premium      : {premium_total:,}",
+            f"👤 Normal       : {normal_total:,}",
+            "",
+            "🌐  LANGUAGE BREAKDOWN",
+            "─────────────────────────",
+        ]
+        if not by_lang:
+            lines.append("No data yet.")
+        for key in sorted(by_lang, key=lambda k: by_lang[k].get("total", 0), reverse=True):
+            bucket = by_lang[key]
+            b_total = bucket.get("total", 0)
+            b_premium = bucket.get("premium", 0)
+            b_normal = b_total - b_premium
+            label = key if key != "unknown" else "unknown"
+            lines.append(f"[{label}]")
+            lines.append(f"Total   : {b_total:,}")
+            lines.append(f"Premium : {b_premium:,}")
+            lines.append(f"Normal  : {b_normal:,}")
+        return "\n".join(lines)
 
     async def _broadcast_progress(
         self,
@@ -437,7 +566,21 @@ class AssistantRuntime:
 
         if cb_data == f"astats:{self.assistant_id}":
             await event.edit("Processing...")
-            await event.edit(self._stats_text())
+            await event.edit(self._stats_text(), buttons=self._stats_buttons())
+            return
+
+        if cb_data == f"astatsdc:{self.assistant_id}":
+            await event.edit(
+                self._stats_dc_text(),
+                buttons=[[Button.inline("🔙 Back", data=f"astats:{self.assistant_id}")]],
+            )
+            return
+
+        if cb_data == f"astatslang:{self.assistant_id}":
+            await event.edit(
+                self._stats_lang_text(),
+                buttons=[[Button.inline("🔙 Back", data=f"astats:{self.assistant_id}")]],
+            )
             return
 
         if cb_data == f"abroadcast:{self.assistant_id}":

@@ -11,8 +11,16 @@ from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.errors import EntryNotFoundError, RepositoryNotFoundError
 
 from app.config import Settings
+from app.utils.stats_agg import empty_stats_agg
 
 logger = logging.getLogger(__name__)
+
+# Bump whenever the per-user record shape changes in a way old records can't
+# just be lazily upgraded from (v2 added dc_id / lang_code / stats_agg).
+# Bumping this wipes ``users`` / ``stats`` / ``stats_agg`` / ``reply_map`` for
+# the master bot and every assistant on next boot -- sessions, owner/admin
+# ids and blocked lists are preserved so nothing needs to be reconnected.
+SCHEMA_VERSION = 2
 
 
 class HFDataStore:
@@ -34,16 +42,51 @@ class HFDataStore:
     def _default_data() -> dict[str, Any]:
         return {
             "version": 1,
+            "schema_version": SCHEMA_VERSION,
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "master": {
                 "users": {},
                 "admins": [],
                 "banned": [],
                 "stats": {"total_starts": 0, "total_messages": 0},
+                "stats_agg": empty_stats_agg(),
                 "session_b64": "",
             },
             "assistants": {},
         }
+
+    def _migrate_schema_if_needed(self) -> None:
+        """One-time reset of per-user stats data when SCHEMA_VERSION bumps.
+
+        Only ``users``/``stats``/``stats_agg``/``reply_map`` are cleared —
+        session_b64, owner_id, log_chat_id, admins and blocked_users are all
+        left untouched, so no bot needs to be reconnected because of this.
+        """
+        current = self.data.get("schema_version", 1)
+        if current >= SCHEMA_VERSION:
+            return
+
+        logger.warning(
+            "DB schema %s -> %s: clearing users/stats/stats_agg/reply_map "
+            "for master + %d assistant(s). Sessions and admin/owner config "
+            "are preserved.",
+            current,
+            SCHEMA_VERSION,
+            len(self.data.get("assistants", {})),
+        )
+
+        scopes = [self.data.setdefault("master", {})]
+        scopes.extend(self.data.get("assistants", {}).values())
+        for scope in scopes:
+            scope["users"] = {}
+            scope["stats"] = {"total_starts": 0, "total_messages": 0}
+            scope["stats_agg"] = empty_stats_agg()
+            scope["reply_map"] = {}
+
+        self.data["schema_version"] = SCHEMA_VERSION
+        self._main_dirty = True
+        for aid in self.data.get("assistants", {}):
+            self._assistant_dirty[aid] = True
 
     async def initialize(self) -> None:
         await self._ensure_repo()
@@ -89,17 +132,20 @@ class HFDataStore:
                     logger.info("Migrating from legacy %s to split-file format.", self.LEGACY_FILE)
                     self.data = legacy
                     self.data.setdefault("assistants", {})
+                    self.data.setdefault("schema_version", 1)
                     self._main_dirty = True
                     for aid in self.data.get("assistants", {}):
                         self._assistant_dirty[aid] = True
                 else:
                     self.data = self._default_data()
                     self._main_dirty = True
+                self._migrate_schema_if_needed()
                 await self._sync_unlocked()
                 return
 
             self.data = {
                 "version": main_data.get("version", 1),
+                "schema_version": main_data.get("schema_version", 1),
                 "updated_at": main_data.get("updated_at", datetime.now(timezone.utc).isoformat()),
                 "master": main_data.get("master", self._default_data()["master"]),
                 "assistants": {},
@@ -113,6 +159,10 @@ class HFDataStore:
                     logger.warning("Assistant file for %s not found in HF; skipping.", aid)
                     # Stale ID – update main_db on the next sync to remove it.
                     self._main_dirty = True
+
+            self._migrate_schema_if_needed()
+            if self._is_dirty():
+                await self._sync_unlocked()
 
     def get_data(self) -> dict[str, Any]:
         return self.data
@@ -184,6 +234,7 @@ class HFDataStore:
         if self._main_dirty:
             main_payload = {
                 "version": self.data.get("version", 1),
+                "schema_version": self.data.get("schema_version", SCHEMA_VERSION),
                 "updated_at": self.data.get("updated_at"),
                 "master": self.data.get("master", {}),
                 # Keep track of which per-assistant files exist
