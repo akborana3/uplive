@@ -1,4 +1,5 @@
 import base64
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -9,6 +10,9 @@ from telethon import Button, TelegramClient, events
 from app.config import Settings
 from app.session_manager import SessionManager
 from app.storage.hf_dataset import HFDataStore
+
+# BotFather tokens look like "123456789:ABCdefGhIJKlmNoPQRstuVwxyZ012345678"
+_BOT_TOKEN_RE = re.compile(r"^\d{6,12}:[A-Za-z0-9_-]{30,45}$")
 
 
 class MasterController:
@@ -161,6 +165,77 @@ class MasterController:
         await self.sessions.start_assistant(assistant_id, assistants[assistant_id])
         self.pending_connect.pop(user_id, None)
 
+    async def _session_from_bot_token(self, token: str) -> tuple[bytes, Any]:
+        """Log in with a BotFather token and return (session_bytes, me).
+
+        Telethon's ``client.start(bot_token=...)`` handles the whole bot auth
+        flow and writes a normal .session file to disk — no manual login
+        script, no phone/code needed. That file is then read back and
+        base64-encoded exactly like an uploaded .session, so it's stored and
+        restarted through the identical path as before.
+        """
+        with TemporaryDirectory() as td:
+            session_path = Path(td) / "bot.session"
+            test_client = TelegramClient(str(session_path), self.settings.api_id, self.settings.api_hash)
+            try:
+                await test_client.start(bot_token=token)
+                me = await test_client.get_me()
+                if not me:
+                    raise ValueError("Could not resolve bot identity from token")
+            finally:
+                await test_client.disconnect()
+            return session_path.read_bytes(), me
+
+    async def _handle_connect_token(self, event: events.NewMessage.Event) -> bool:
+        pending = self.pending_connect.get(event.sender_id or 0)
+        if not pending or pending.get("step") != "token":
+            return False
+
+        text = (event.raw_text or "").strip()
+        if not _BOT_TOKEN_RE.match(text):
+            await event.reply(
+                "That doesn't look like a bot token. It should look like "
+                "`123456789:ABCdefGhIJKlmNoPQRstuVwxyZ012345678` "
+                "(get one from @BotFather). Send it again, or press Cancel."
+            )
+            return True
+
+        try:
+            session_bytes, me = await self._session_from_bot_token(text)
+        except Exception as exc:
+            await event.reply(
+                f"Couldn't log in with that token ({exc}). "
+                "Double-check it's correct and still active, then send it again."
+            )
+            return True
+
+        pending["assistant_id"] = str(me.id)
+        pending["bot_username"] = me.username or ""
+        if pending.get("mode") == "replace" and pending.get("target_assistant_id") != str(me.id):
+            await event.reply(
+                "This bot token belongs to a different bot than the one you're replacing."
+            )
+            return True
+
+        pending["session_b64"] = base64.b64encode(session_bytes).decode("utf-8")
+
+        if pending.get("mode") == "replace":
+            pending["step"] = "done"
+            await self._activate_assistant(event.sender_id or 0)
+            await event.reply("Assistant session replaced and restarted.")
+            return True
+
+        pending["step"] = "log_chat"
+        await event.reply(
+            "Add this bot to a group and make it admin for logs.\n"
+            "Send log group ID now or press SKIP.",
+            buttons=[
+                [Button.inline("SKIP", data="m_skiplog")],
+                [Button.inline("❌ Cancel", data="m_cancel")],
+            ],
+        )
+        return True
+
     async def _handle_connect_upload(self, event: events.NewMessage.Event) -> bool:
         pending = self.pending_connect.get(event.sender_id or 0)
         if not pending or pending.get("step") != "upload":
@@ -275,6 +350,8 @@ class MasterController:
 
         if await self._handle_connect_upload(event):
             return
+        if await self._handle_connect_token(event):
+            return
         if await self._handle_connect_log_chat(event):
             return
 
@@ -293,9 +370,40 @@ class MasterController:
             return
 
         if cb_data == "m_connect":
-            self.pending_connect[user_id] = {"step": "upload", "mode": "connect"}
+            self.pending_connect[user_id] = {"step": "choose_method", "mode": "connect"}
+            await event.edit(
+                "How do you want to connect the bot?",
+                buttons=[
+                    [Button.inline("📄 Upload .session file", data="m_method_session")],
+                    [Button.inline("🔑 Bot Token", data="m_method_token")],
+                    [Button.inline("❌ Cancel", data="m_cancel")],
+                ],
+            )
+            return
+
+        if cb_data == "m_method_session":
+            pending = self.pending_connect.get(user_id)
+            if not pending or pending.get("step") != "choose_method":
+                await event.answer("No pending connect flow", alert=True)
+                return
+            pending["step"] = "upload"
             await event.edit(
                 "Upload your .session file now.",
+                buttons=[[Button.inline("❌ Cancel", data="m_cancel")]],
+            )
+            return
+
+        if cb_data == "m_method_token":
+            pending = self.pending_connect.get(user_id)
+            if not pending or pending.get("step") != "choose_method":
+                await event.answer("No pending connect flow", alert=True)
+                return
+            pending["step"] = "token"
+            await event.edit(
+                "Send me the bot token from @BotFather.\n"
+                "It looks like `123456789:ABCdefGhIJKlmNoPQRstuVwxyZ012345678`.\n\n"
+                "I'll log in with it and generate the session automatically — "
+                "nothing else to set up on your end.",
                 buttons=[[Button.inline("❌ Cancel", data="m_cancel")]],
             )
             return
@@ -438,12 +546,16 @@ class MasterController:
                 await event.answer("Not found", alert=True)
                 return
             self.pending_connect[user_id] = {
-                "step": "upload",
+                "step": "choose_method",
                 "mode": "replace",
                 "target_assistant_id": aid,
             }
             await event.edit(
-                f"Upload replacement .session for assistant {aid}.",
-                buttons=[[Button.inline("❌ Cancel", data="m_cancel")]],
+                f"How do you want to replace the session for assistant {aid}?",
+                buttons=[
+                    [Button.inline("📄 Upload .session file", data="m_method_session")],
+                    [Button.inline("🔑 Bot Token", data="m_method_token")],
+                    [Button.inline("❌ Cancel", data="m_cancel")],
+                ],
             )
             return

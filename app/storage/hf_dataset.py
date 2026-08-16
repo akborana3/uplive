@@ -210,24 +210,30 @@ class HFDataStore:
         await asyncio.to_thread(_delete)
 
     async def _upload_json(self, filename: str, payload: dict[str, Any]) -> None:
-        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json", encoding="utf-8") as tf:
-            json.dump(payload, tf, ensure_ascii=False, indent=2)
-            temp_path = tf.name
+        # Snapshot on the event loop first (cheap object copy) so the actual
+        # json.dump + upload can run entirely in a worker thread without
+        # racing against concurrent mutations to self.data happening on the
+        # loop while serialization is in flight — dict mutation isn't safe to
+        # interleave with json.dump iterating the same structure.
+        snapshot = copy.deepcopy(payload)
 
-        def _upload() -> None:
-            self.api.upload_file(
-                path_or_fileobj=temp_path,
-                path_in_repo=filename,
-                repo_id=self.settings.hf_repo_id,
-                repo_type="dataset",
-                token=self.settings.hf_token,
-                commit_message=f"sync {filename}",
-            )
+        def _dump_and_upload() -> None:
+            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".json", encoding="utf-8") as tf:
+                json.dump(snapshot, tf, ensure_ascii=False, indent=2)
+                temp_path = tf.name
+            try:
+                self.api.upload_file(
+                    path_or_fileobj=temp_path,
+                    path_in_repo=filename,
+                    repo_id=self.settings.hf_repo_id,
+                    repo_type="dataset",
+                    token=self.settings.hf_token,
+                    commit_message=f"sync {filename}",
+                )
+            finally:
+                Path(temp_path).unlink(missing_ok=True)
 
-        try:
-            await asyncio.to_thread(_upload)
-        finally:
-            Path(temp_path).unlink(missing_ok=True)
+        await asyncio.to_thread(_dump_and_upload)
 
     async def _sync_unlocked(self) -> None:
         """Upload all dirty files. Caller must hold ``self._lock``."""

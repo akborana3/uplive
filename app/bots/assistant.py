@@ -130,8 +130,8 @@ class AssistantRuntime:
     async def _log_user_message(self, event: events.NewMessage.Event, user_id: int) -> None:
         """Forward a user message to the log chat.
 
-        Runs as a LOG-priority task in the worker pool so it never blocks the
-        event handler.  Each Telegram API call is gated by ``api_sem``.
+        Runs as part of the LOG-priority task (see ``_track_and_log``), so it
+        never blocks the reply. Each Telegram API call is gated by ``api_sem``.
         """
         try:
             target = self.data.get("log_chat_id") or self.data["owner_id"]
@@ -149,6 +149,38 @@ class AssistantRuntime:
                 self.assistant_id,
                 user_id,
             )
+
+    async def _track_and_log(
+        self, event: events.NewMessage.Event, user_id: int, is_start: bool
+    ) -> None:
+        """LOG-priority task: resolve sender info, update stats, forward to log chat.
+
+        This is where ``event.get_sender()`` actually happens — deliberately
+        *not* in the event handler and *not* on the reply's path. The
+        auto-reply payload never depends on premium/dc/lang, so those never
+        need to be known before a user gets their reply; this task can lag
+        slightly behind under load without slowing down the thing users
+        actually notice.
+        """
+        try:
+            sender = await event.get_sender()
+        except Exception:
+            sender = None
+        premium = bool(getattr(sender, "premium", False))
+        lang_code = getattr(sender, "lang_code", None)
+        photo = getattr(sender, "photo", None)
+        dc_id = getattr(photo, "dc_id", None) if photo else None
+
+        user_data = self._ensure_user(user_id, premium, dc_id=dc_id, lang_code=lang_code)
+        user_data["message_count"] += 1
+        stats = self.data.setdefault("stats", {"total_starts": 0, "total_messages": 0})
+        stats["total_messages"] += 1
+        if is_start:
+            user_data["start_count"] += 1
+            stats["total_starts"] += 1
+        self.store.mark_dirty(self.assistant_id)
+
+        await self._log_user_message(event, user_id)
 
     async def _apply_auto_reply(self, user_id: int, is_start: bool) -> None:
         """Send the configured auto-reply.
@@ -288,30 +320,21 @@ class AssistantRuntime:
         if event.sender_id in self.data.get("blocked_users", []):
             return
 
-        sender = await event.get_sender()
-        premium = bool(getattr(sender, "premium", False))
-        lang_code = getattr(sender, "lang_code", None)
-        photo = getattr(sender, "photo", None)
-        dc_id = getattr(photo, "dc_id", None) if photo else None
-        user_data = self._ensure_user(event.sender_id, premium, dc_id=dc_id, lang_code=lang_code)
-        user_data["message_count"] += 1
-        self.data.setdefault("stats", {"total_starts": 0, "total_messages": 0})
-        self.data["stats"]["total_messages"] += 1
-
         is_start = (event.raw_text or "").strip().startswith("/start")
-        if is_start:
-            user_data["start_count"] += 1
-            self.data["stats"]["total_starts"] += 1
 
-        self.store.mark_dirty(self.assistant_id)
-
-        # Hand off to the priority worker pool so the event handler returns
-        # immediately.  USER replies are processed before LOG forwarding.
+        # Nothing below this point makes a Telegram API call — the handler
+        # returns immediately regardless of load, so Telethon's update loop
+        # is never stalled waiting on a get_sender() round-trip during a
+        # burst. The reply doesn't need sender info at all (start_post/setmsg
+        # aren't personalized), so it's queued straight away at USER
+        # priority; sender resolution + stats + log-forwarding happen
+        # separately at LOG priority and can lag slightly under load without
+        # ever delaying what the user actually sees.
         self._pool.enqueue_nowait(
             self._apply_auto_reply(event.sender_id, is_start), Priority.USER
         )
         self._pool.enqueue_nowait(
-            self._log_user_message(event, event.sender_id), Priority.LOG
+            self._track_and_log(event, event.sender_id, is_start), Priority.LOG
         )
 
     def _stats_agg(self) -> dict[str, Any]:
