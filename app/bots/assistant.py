@@ -74,14 +74,77 @@ class AssistantRuntime:
         self.client.add_event_handler(self._on_new_message, events.NewMessage(incoming=True))
         self.client.add_event_handler(self._on_callback, events.CallbackQuery)
 
-    def _ensure_user(
+    def _ensure_user_instant(self, user_id: int, is_start: bool) -> dict[str, Any]:
+        """Create/update a user record and bump message/start counters — with
+        ZERO Telegram API calls, run synchronously from the event handler.
+
+        This is what makes a brand-new user immediately visible to /broadcast
+        and /stats, even if the LOG queue (which resolves premium/dc/lang and
+        forwards to the log chat) is way behind under a traffic spike. premium
+        /dc/lang start out unknown here and are filled in later by
+        ``_enrich_user`` without double-counting anything.
+        """
+        users = self.data.setdefault("users", {})
+        agg = self.data.setdefault("stats_agg", empty_stats_agg())
+        user_key = str(user_id)
+        now = datetime.now(timezone.utc).isoformat()
+
+        if user_key not in users:
+            users[user_key] = {
+                "premium": False,
+                "blocked": False,
+                "first_seen": now,
+                "last_seen": now,
+                "start_count": 0,
+                "message_count": 0,
+                "dc_id": "unknown",
+                "lang_code": "unknown",
+            }
+            agg_add(agg, "unknown", "unknown", False)
+
+        rec = users[user_key]
+        rec["last_seen"] = now
+        rec["message_count"] += 1
+        stats = self.data.setdefault("stats", {"total_starts": 0, "total_messages": 0})
+        stats["total_messages"] += 1
+        if is_start:
+            rec["start_count"] += 1
+            stats["total_starts"] += 1
+        self.store.mark_dirty(self.assistant_id)
+        return rec
+
+    def _ensure_user_record(self, user_id: int) -> dict[str, Any]:
+        """Get-or-create a bare user record, WITHOUT touching message/start
+        counters. Used by admin commands (e.g. /ban) that may reference a
+        user who has never actually messaged the bot."""
+        users = self.data.setdefault("users", {})
+        agg = self.data.setdefault("stats_agg", empty_stats_agg())
+        user_key = str(user_id)
+        if user_key not in users:
+            now = datetime.now(timezone.utc).isoformat()
+            users[user_key] = {
+                "premium": False,
+                "blocked": False,
+                "first_seen": now,
+                "last_seen": now,
+                "start_count": 0,
+                "message_count": 0,
+                "dc_id": "unknown",
+                "lang_code": "unknown",
+            }
+            agg_add(agg, "unknown", "unknown", False)
+        return users[user_key]
+
+    def _enrich_user(
         self,
         user_id: int,
         premium: bool,
         dc_id: int | str | None = None,
         lang_code: str | None = None,
-    ) -> dict[str, Any]:
-        """Create/update a user record and keep ``stats_agg`` in sync in O(1).
+    ) -> dict[str, Any] | None:
+        """Fill in premium/dc/lang on an already-counted user record and keep
+        ``stats_agg`` in sync in O(1). Never touches message/start counters —
+        those are only ever bumped by ``_ensure_user_instant``.
 
         ``dc_id``/``lang_code`` are only resolved from Telegram some of the
         time (dc_id needs a profile photo, lang_code needs Telegram to have
@@ -91,26 +154,14 @@ class AssistantRuntime:
         users = self.data.setdefault("users", {})
         agg = self.data.setdefault("stats_agg", empty_stats_agg())
         user_key = str(user_id)
-        now = datetime.now(timezone.utc).isoformat()
+        rec = users.get(user_key)
+        if rec is None:
+            # _ensure_user_instant always runs first for real user traffic;
+            # this guards against the (theoretical) case it didn't.
+            return None
+
         new_dc = dc_bucket_key(dc_id)
         new_lang = lang_bucket_key(lang_code)
-
-        if user_key not in users:
-            users[user_key] = {
-                "premium": premium,
-                "blocked": False,
-                "first_seen": now,
-                "last_seen": now,
-                "start_count": 0,
-                "message_count": 0,
-                "dc_id": new_dc,
-                "lang_code": new_lang,
-            }
-            agg_add(agg, new_dc, new_lang, premium)
-            return users[user_key]
-
-        rec = users[user_key]
-        rec["last_seen"] = now
 
         old_dc = rec.get("dc_id", "unknown")
         old_lang = rec.get("lang_code", "unknown")
@@ -130,10 +181,14 @@ class AssistantRuntime:
     async def _log_user_message(self, event: events.NewMessage.Event, user_id: int) -> None:
         """Forward a user message to the log chat.
 
-        Runs as part of the LOG-priority task (see ``_track_and_log``), so it
+        Runs as part of the LOG-priority task (see ``_enrich_and_log``), so it
         never blocks the reply. Each Telegram API call is gated by ``api_sem``.
+        Backs off first if a broadcast is currently running (see
+        ``WorkerPool.wait_for_broadcast_clearance``), so a deep log backlog
+        never eats into a broadcast's share of the send budget.
         """
         try:
+            await self._pool.wait_for_broadcast_clearance()
             target = self.data.get("log_chat_id") or self.data["owner_id"]
             header = f"📩 Assistant {self.assistant_id}\nFrom: `{user_id}`"
             async with self._pool.api_sem:
@@ -150,17 +205,17 @@ class AssistantRuntime:
                 user_id,
             )
 
-    async def _track_and_log(
-        self, event: events.NewMessage.Event, user_id: int, is_start: bool
-    ) -> None:
-        """LOG-priority task: resolve sender info, update stats, forward to log chat.
+    async def _enrich_and_log(self, event: events.NewMessage.Event, user_id: int) -> None:
+        """LOG-priority task: resolve sender info, forward to log chat.
 
-        This is where ``event.get_sender()`` actually happens — deliberately
-        *not* in the event handler and *not* on the reply's path. The
-        auto-reply payload never depends on premium/dc/lang, so those never
-        need to be known before a user gets their reply; this task can lag
-        slightly behind under load without slowing down the thing users
-        actually notice.
+        Counting (user creation, total_starts, total_messages) already
+        happened instantly and synchronously in ``_on_new_message`` via
+        ``_ensure_user_instant`` — before this task was even queued — so a
+        deep backlog here never delays a user showing up in /broadcast or
+        /stats. This task only fills in premium/dc/lang (which need an API
+        round-trip via ``event.get_sender()``) and forwards the message to
+        the log chat. It can lag behind under load without affecting stats,
+        broadcast eligibility, or the auto-reply the user actually sees.
         """
         try:
             sender = await event.get_sender()
@@ -171,13 +226,7 @@ class AssistantRuntime:
         photo = getattr(sender, "photo", None)
         dc_id = getattr(photo, "dc_id", None) if photo else None
 
-        user_data = self._ensure_user(user_id, premium, dc_id=dc_id, lang_code=lang_code)
-        user_data["message_count"] += 1
-        stats = self.data.setdefault("stats", {"total_starts": 0, "total_messages": 0})
-        stats["total_messages"] += 1
-        if is_start:
-            user_data["start_count"] += 1
-            stats["total_starts"] += 1
+        self._enrich_user(user_id, premium, dc_id=dc_id, lang_code=lang_code)
         self.store.mark_dirty(self.assistant_id)
 
         await self._log_user_message(event, user_id)
@@ -220,11 +269,11 @@ class AssistantRuntime:
                 self.data.setdefault("blocked_users", [])
                 if target not in self.data["blocked_users"]:
                     self.data["blocked_users"].append(target)
-                user_data = self._ensure_user(target, False)
+                user_data = self._ensure_user_record(target)
                 user_data["blocked"] = True
             elif command == "/unban":
                 self.data["blocked_users"] = [x for x in self.data.get("blocked_users", []) if x != target]
-                user_data = self._ensure_user(target, False)
+                user_data = self._ensure_user_record(target)
                 user_data["blocked"] = False
             elif command == "/promote":
                 self.data.setdefault("admins", [])
@@ -322,19 +371,28 @@ class AssistantRuntime:
 
         is_start = (event.raw_text or "").strip().startswith("/start")
 
+        # Instant, synchronous, zero-API-call counting: the user record and
+        # total_starts/total_messages are updated right here, before either
+        # task below is even queued. This is what keeps /broadcast and /stats
+        # accurate in real time no matter how deep the LOG queue gets during
+        # a traffic spike (e.g. 50k new users in an hour) — a user is
+        # broadcastable the instant their /start lands, not once their
+        # sender-info-resolution + log-forward task gets a turn.
+        self._ensure_user_instant(event.sender_id, is_start)
+
         # Nothing below this point makes a Telegram API call — the handler
         # returns immediately regardless of load, so Telethon's update loop
         # is never stalled waiting on a get_sender() round-trip during a
         # burst. The reply doesn't need sender info at all (start_post/setmsg
         # aren't personalized), so it's queued straight away at USER
-        # priority; sender resolution + stats + log-forwarding happen
-        # separately at LOG priority and can lag slightly under load without
-        # ever delaying what the user actually sees.
+        # priority; sender resolution + log-forwarding happen separately at
+        # LOG priority and can lag behind under load without ever delaying
+        # what the user actually sees or affecting stats/broadcast.
         self._pool.enqueue_nowait(
             self._apply_auto_reply(event.sender_id, is_start), Priority.USER
         )
         self._pool.enqueue_nowait(
-            self._track_and_log(event, event.sender_id, is_start), Priority.LOG
+            self._enrich_and_log(event, event.sender_id), Priority.LOG
         )
 
     def _stats_agg(self) -> dict[str, Any]:

@@ -228,6 +228,34 @@ class WorkerPool:
         """Return the total number of tasks waiting across both queues."""
         return self._bc_queue.qsize() + self._msg_queue.qsize()
 
+    # Max time a single LOG-priority send backs off for while a broadcast is
+    # running, per call to wait_for_broadcast_clearance(). Bounded so a long
+    # broadcast can't fully starve log-catchup — it just trickles through at
+    # a much lower rate while the broadcast has the floor.
+    LOG_BROADCAST_BACKOFF_STEP: float = 0.2
+    LOG_BROADCAST_MAX_WAIT: float = 2.0
+
+    async def wait_for_broadcast_clearance(self) -> None:
+        """Best-effort yield for LOG-priority senders.
+
+        While a broadcast is in flight (``broadcast_lock`` held), this backs
+        off in short steps so the broadcast — which shares the same
+        ``api_sem`` — gets first claim on the send budget instead of a deep
+        log backlog competing with it 1:1. It never blocks indefinitely: it
+        gives up after ``LOG_BROADCAST_MAX_WAIT`` seconds so log-catchup
+        still trickles through even during a very long broadcast. The moment
+        the broadcast finishes, callers stop backing off immediately and
+        log-catchup goes back to full speed (bounded only by ``api_sem``'s
+        own adaptive ceiling and however many workers the scaler has spun up
+        for the backlog).
+        """
+        if not self.broadcast_lock.locked():
+            return
+        waited = 0.0
+        while self.broadcast_lock.locked() and waited < self.LOG_BROADCAST_MAX_WAIT:
+            await asyncio.sleep(self.LOG_BROADCAST_BACKOFF_STEP)
+            waited += self.LOG_BROADCAST_BACKOFF_STEP
+
     def active_workers(self) -> int:
         """Return the number of worker tasks that have not yet finished."""
         return (
