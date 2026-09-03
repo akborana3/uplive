@@ -1,4 +1,5 @@
 import base64
+import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +11,8 @@ from telethon import Button, TelegramClient, events
 from app.config import Settings
 from app.session_manager import SessionManager
 from app.storage.hf_dataset import HFDataStore
+
+logger = logging.getLogger(__name__)
 
 # BotFather tokens look like "123456789:ABCdefGhIJKlmNoPQRstuVwxyZ012345678"
 _BOT_TOKEN_RE = re.compile(r"^\d{6,12}:[A-Za-z0-9_-]{30,45}$")
@@ -38,6 +41,10 @@ class MasterController:
         await self.client.start()
         self.client.add_event_handler(self._on_new_message, events.NewMessage(incoming=True))
         self.client.add_event_handler(self._on_callback, events.CallbackQuery)
+        logger.info(
+            "MASTER — handlers registered, client is_bot=%s",
+            await self.client.is_bot(),
+        )
 
     async def run(self) -> None:
         await self.client.run_until_disconnected()
@@ -336,6 +343,12 @@ class MasterController:
         if user_id == 0 or not event.is_private:
             return
 
+        logger.info(
+            "MASTER — message from %s: %r",
+            user_id,
+            (event.raw_text or "")[:80],
+        )
+
         self._ensure_master_user(user_id)
         self._master_data().setdefault("stats", {"total_starts": 0, "total_messages": 0})
         self._master_data()["stats"]["total_messages"] += 1
@@ -360,10 +373,13 @@ class MasterController:
             self._master_data()["stats"]["total_starts"] += 1
             self.store.mark_dirty()
             await event.reply("Master Control Panel", buttons=self._main_menu())
+            logger.info("MASTER — sent menu reply to %s", user_id)
 
     async def _on_callback(self, event: events.CallbackQuery.Event) -> None:
         user_id = event.sender_id or 0
         cb_data = (event.data or b"").decode("utf-8")
+
+        logger.info("MASTER — callback from %s: %s", user_id, cb_data)
 
         if self._is_banned(user_id):
             await event.answer("Banned", alert=True)
